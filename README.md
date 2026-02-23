@@ -1,6 +1,7 @@
 # f-jira
 
-A terminal UI for exporting JIRA data into a local SQLite database, with re-export to CSV, JIRA-importable CSV, or JSON.
+A terminal UI for exporting JIRA and Confluence data into a local SQLite database, with re-export
+to CSV, JSON, or JIRA-importable CSV.
 
 ## Quick start
 
@@ -16,26 +17,39 @@ You'll be prompted for:
 
 ## What it does
 
-1. Validates your credentials against the JIRA API
-2. Lists all accessible projects with key, name, type, and lead
-3. Exports selected projects — all issues, comments, links, and custom fields — into `jira_export.db`
-4. Offers re-export as CSV, JIRA-importable CSV, or JSON into the `exports/` directory
+1. Validates your credentials against the Atlassian API
+2. Lets you choose **JIRA** or **Confluence** on the service selection screen
+3. Lists all accessible projects (JIRA) or spaces (Confluence)
+4. Exports selected items — issues/comments/links or pages/comments — into `jira_export.db`
+5. Offers re-export in multiple formats into the `exports/` directory
+
+You can go back and export from both services in the same session — everything accumulates in the
+same database.
 
 ## Export formats
 
-| Format | Description |
-|---|---|
-| **CSV** | `issues.csv` + `comments.csv` with all core and custom fields |
-| **JIRA CSV** | Follows JIRA's CSV import format with repeated headers for multi-value fields |
-| **JSON** | Full raw API response per issue |
+| Format | Service | Description |
+|---|---|---|
+| **CSV** | JIRA | `issues.csv` + `comments.csv` with all core and custom fields |
+| **JIRA CSV** | JIRA | Follows JIRA's CSV import format with repeated headers for multi-value fields |
+| **JSON** | JIRA | Full raw API response per issue |
+| **Confluence CSV** | Confluence | `pages.csv` + `page_comments.csv` |
+| **Confluence JSON** | Confluence | Full raw API response per page |
+
+### Split export
+
+A **split toggle** on the results screen lets you choose between:
+
+- **Off** (default) — one combined file for all projects or spaces
+- **On** — one file per project/space (e.g. `issues_PROJ1.csv`, `pages_12345.csv`)
 
 ## Keyboard shortcuts
 
 | Key | Action |
 |---|---|
 | `Ctrl+Q` | Quit |
-| `A` | Select all projects |
-| `N` | Deselect all projects |
+| `A` | Select all projects / spaces |
+| `N` | Deselect all projects / spaces |
 | `Escape` | Back / Cancel |
 
 ## Requirements

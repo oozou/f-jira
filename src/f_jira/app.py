@@ -21,6 +21,7 @@ from textual.widgets import (
     Log,
     ProgressBar,
     Static,
+    Switch,
 )
 
 from f_jira.api import JiraClient
@@ -657,6 +658,11 @@ class ResultsScreen(Screen):
             yield Label("Export Results", id="results-title")
             yield Static(id="stats-display")
             yield Label("")
+            with Center():
+                with Horizontal(id="split-row"):
+                    yield Switch(id="split-toggle", value=False)
+                    yield Label("Split files by project / space", id="split-label")
+            yield Label("")
             yield Label("JIRA export formats:", id="jira-export-label")
             with Center():
                 with Horizontal(id="export-buttons"):
@@ -748,47 +754,53 @@ class ResultsScreen(Screen):
 
     def _do_export(self, fmt: str) -> None:
         status = self.query_one("#export-status", Label)
+        split = self.query_one("#split-toggle", Switch).value
+
         try:
             db = Database(DB_PATH)
-            if fmt == "csv":
-                files = export_csv(db, EXPORT_DIR)
-                db.close()
-                if files:
-                    paths = ", ".join(str(f) for f in files)
-                    status.update(f"[green]CSV exported: {paths}[/green]")
+            all_files: list[Path] = []
+            is_jira_fmt = fmt in ("csv", "jira_csv", "json")
+
+            if split:
+                if is_jira_fmt:
+                    keys = [p["key"] for p in db.get_projects()]
                 else:
-                    status.update("[yellow]No issues to export.[/yellow]")
-            elif fmt == "jira_csv":
-                path = export_jira_csv(db, EXPORT_DIR)
-                db.close()
-                if path:
-                    status.update(f"[green]JIRA CSV exported: {path}[/green]")
-                else:
-                    status.update("[yellow]No issues to export.[/yellow]")
-            elif fmt == "json":
-                path = export_json(db, EXPORT_DIR)
-                db.close()
-                if path:
-                    status.update(f"[green]JSON exported: {path}[/green]")
-                else:
-                    status.update("[yellow]No issues to export.[/yellow]")
-            elif fmt == "confluence_csv":
-                files = export_confluence_csv(db, EXPORT_DIR)
-                db.close()
-                if files:
-                    paths = ", ".join(str(f) for f in files)
-                    status.update(f"[green]Confluence CSV exported: {paths}[/green]")
-                else:
-                    status.update("[yellow]No Confluence pages to export.[/yellow]")
-            elif fmt == "confluence_json":
-                path = export_confluence_json(db, EXPORT_DIR)
-                db.close()
-                if path:
-                    status.update(f"[green]Confluence JSON exported: {path}[/green]")
-                else:
-                    status.update("[yellow]No Confluence pages to export.[/yellow]")
+                    keys = [str(s["id"]) for s in db.get_confluence_spaces()]
+
+                for key in keys:
+                    all_files.extend(self._export_one(db, fmt, key))
+            else:
+                all_files.extend(self._export_one(db, fmt))
+
+            db.close()
+
+            if all_files:
+                paths = ", ".join(str(f) for f in all_files)
+                status.update(f"[green]Exported: {paths}[/green]")
+            else:
+                status.update("[yellow]No data to export.[/yellow]")
         except Exception as exc:
             status.update(f"[red]Export failed: {exc}[/red]")
+
+    @staticmethod
+    def _export_one(
+        db: Database, fmt: str, filter_key: str | None = None
+    ) -> list[Path]:
+        """Run a single export pass, returning all created file paths."""
+        if fmt == "csv":
+            return export_csv(db, EXPORT_DIR, project_key=filter_key)
+        if fmt == "jira_csv":
+            path = export_jira_csv(db, EXPORT_DIR, project_key=filter_key)
+            return [path] if path else []
+        if fmt == "json":
+            path = export_json(db, EXPORT_DIR, project_key=filter_key)
+            return [path] if path else []
+        if fmt == "confluence_csv":
+            return export_confluence_csv(db, EXPORT_DIR, space_id=filter_key)
+        if fmt == "confluence_json":
+            path = export_confluence_json(db, EXPORT_DIR, space_id=filter_key)
+            return [path] if path else []
+        return []
 
     @on(Button.Pressed, "#more-btn")
     def handle_more(self) -> None:
@@ -931,6 +943,15 @@ class JiraExportApp(App):
         padding: 1 2;
         border: solid $accent;
         background: $surface;
+    }
+
+    #split-row {
+        height: 3;
+        width: auto;
+    }
+
+    #split-label {
+        padding: 1 1;
     }
 
     #export-buttons, #confluence-export-buttons {
