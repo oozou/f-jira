@@ -1,4 +1,4 @@
-"""Textual TUI for JIRA data export."""
+"""Textual TUI for JIRA and Confluence data export."""
 
 from __future__ import annotations
 
@@ -24,8 +24,15 @@ from textual.widgets import (
 )
 
 from f_jira.api import JiraClient
+from f_jira.confluence_api import ConfluenceClient
 from f_jira.db import Database
-from f_jira.export import export_csv, export_jira_csv, export_json
+from f_jira.export import (
+    export_confluence_csv,
+    export_confluence_json,
+    export_csv,
+    export_jira_csv,
+    export_json,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,13 +41,13 @@ EXPORT_DIR = Path("exports")
 
 
 class LoginScreen(Screen):
-    """Screen for entering JIRA credentials."""
+    """Screen for entering Atlassian credentials."""
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Center():
             with Vertical(id="login-form"):
-                yield Label("JIRA Export Tool", id="title")
+                yield Label("Atlassian Export Tool", id="title")
                 yield Label("Enter your Atlassian credentials to get started.", id="subtitle")
                 yield Label("")
                 yield Label("Atlassian domain (e.g. mycompany):")
@@ -90,19 +97,50 @@ class LoginScreen(Screen):
                 f"[green]Connected as {display_name} ({account_type})[/green]"
             )
 
-            # Store client on the app for other screens
+            # Store clients on the app — same credentials work for both services
             app = self.app
             assert isinstance(app, JiraExportApp)
             app.jira_client = client
+            app.confluence_client = ConfluenceClient(domain, email, token)
             app.user_info = user_info
 
-            # Transition to project selection
-            self.app.switch_screen(ProjectScreen())
+            # Transition to service selection
+            self.app.switch_screen(ServiceScreen())
 
         except Exception as exc:
             await client.close()
             status.update(f"[red]Connection failed: {exc}[/red]")
             btn.disabled = False
+
+
+class ServiceScreen(Screen):
+    """Screen for choosing which service to export: JIRA or Confluence."""
+
+    BINDINGS = [Binding("escape", "go_back", "Back")]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Center():
+            with Vertical(id="service-form"):
+                yield Label("What do you want to export?", id="service-title")
+                yield Label("")
+                yield Button("JIRA", variant="primary", id="jira-btn")
+                yield Label("Export projects, issues, and comments from JIRA", id="jira-desc")
+                yield Label("")
+                yield Button("Confluence", variant="success", id="confluence-btn")
+                yield Label("Export spaces, pages, and comments from Confluence", id="confluence-desc")
+        yield Footer()
+
+    @on(Button.Pressed, "#jira-btn")
+    def handle_jira(self) -> None:
+        self.app.switch_screen(ProjectScreen())
+
+    @on(Button.Pressed, "#confluence-btn")
+    def handle_confluence(self) -> None:
+        self.app.switch_screen(SpaceScreen())
+
+    def action_go_back(self) -> None:
+        self.app.switch_screen(LoginScreen())
 
 
 class ProjectScreen(Screen):
@@ -209,11 +247,11 @@ class ProjectScreen(Screen):
         self.action_go_back()
 
     def action_go_back(self) -> None:
-        self.app.switch_screen(LoginScreen())
+        self.app.switch_screen(ServiceScreen())
 
 
 class ExportScreen(Screen):
-    """Screen showing export progress."""
+    """Screen showing JIRA export progress."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -283,7 +321,7 @@ class ExportScreen(Screen):
                 log_widget.write_line(f"\n--- {proj_key}: {proj_name} ---")
 
                 # Search issues
-                log_widget.write_line(f"  Searching issues...")
+                log_widget.write_line("  Searching issues...")
                 try:
                     total_count, issues = await client.search_issues(proj_key)
                 except Exception as exc:
@@ -356,7 +394,252 @@ class ExportScreen(Screen):
             )
             task_label.update("[green]Export complete![/green]")
 
-        # Transition to results screen after a brief pause
+        # Transition to results screen
+        self.app.switch_screen(ResultsScreen())
+
+
+class SpaceScreen(Screen):
+    """Screen for selecting Confluence spaces to export."""
+
+    BINDINGS = [
+        Binding("escape", "go_back", "Back"),
+        Binding("a", "select_all", "Select All"),
+        Binding("n", "select_none", "Deselect All"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._spaces: list[dict[str, Any]] = []
+        self._selected: set[str] = set()
+        self._selected_col_key: Any = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical():
+            yield Label("Select Confluence spaces to export", id="proj-title")
+            yield DataTable(id="space-table")
+            with Center():
+                with Horizontal(id="proj-buttons"):
+                    yield Button("Export Selected", variant="primary", id="export-btn")
+                    yield Button("Back", id="back-btn")
+            yield Label("", id="proj-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#space-table", DataTable)
+        table.cursor_type = "row"
+        col_keys = table.add_columns("Selected", "Key", "Name", "Type", "Status")
+        self._selected_col_key = col_keys[0]
+        self._load_spaces()
+
+    @work(exclusive=True)
+    async def _load_spaces(self) -> None:
+        status = self.query_one("#proj-status", Label)
+        status.update("[yellow]Loading Confluence spaces...[/yellow]")
+
+        app = self.app
+        assert isinstance(app, JiraExportApp)
+        try:
+            self._spaces = await app.confluence_client.get_spaces()
+            table = self.query_one("#space-table", DataTable)
+            table.clear()
+            for space in self._spaces:
+                space_id = str(space["id"])
+                table.add_row(
+                    " ",
+                    space.get("key", ""),
+                    space.get("name", ""),
+                    space.get("type", ""),
+                    space.get("status", ""),
+                    key=space_id,
+                )
+            status.update(
+                f"[green]{len(self._spaces)} spaces found. Click rows to select, then Export.[/green]"
+            )
+        except Exception as exc:
+            status.update(f"[red]Failed to load spaces: {exc}[/red]")
+
+    @on(DataTable.RowSelected, "#space-table")
+    def handle_row_selected(self, event: DataTable.RowSelected) -> None:
+        table = self.query_one("#space-table", DataTable)
+        row_key = event.row_key
+        space_id = row_key.value
+        if space_id in self._selected:
+            self._selected.discard(space_id)
+            table.update_cell(row_key, self._selected_col_key, " ")
+        else:
+            self._selected.add(space_id)
+            table.update_cell(row_key, self._selected_col_key, "[green]✓[/green]")
+
+    def action_select_all(self) -> None:
+        table = self.query_one("#space-table", DataTable)
+        for space in self._spaces:
+            space_id = str(space["id"])
+            self._selected.add(space_id)
+            table.update_cell(space_id, self._selected_col_key, "[green]✓[/green]")
+
+    def action_select_none(self) -> None:
+        table = self.query_one("#space-table", DataTable)
+        for space in self._spaces:
+            space_id = str(space["id"])
+            self._selected.discard(space_id)
+            table.update_cell(space_id, self._selected_col_key, " ")
+
+    @on(Button.Pressed, "#export-btn")
+    def handle_export(self) -> None:
+        if not self._selected:
+            self.query_one("#proj-status", Label).update(
+                "[red]Select at least one space to export.[/red]"
+            )
+            return
+        selected_spaces = [
+            s for s in self._spaces if str(s["id"]) in self._selected
+        ]
+        self.app.switch_screen(ConfluenceExportScreen(selected_spaces))
+
+    @on(Button.Pressed, "#back-btn")
+    def handle_back(self) -> None:
+        self.action_go_back()
+
+    def action_go_back(self) -> None:
+        self.app.switch_screen(ServiceScreen())
+
+
+class ConfluenceExportScreen(Screen):
+    """Screen showing Confluence export progress."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, spaces: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self._spaces = spaces
+        self._cancelled = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with VerticalScroll(id="export-container"):
+            yield Label("Exporting Confluence data...", id="export-title")
+            yield Label("", id="current-task")
+            yield ProgressBar(id="overall-progress", total=100, show_eta=False)
+            yield Label("", id="progress-label")
+            yield Log(id="export-log", auto_scroll=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._run_export()
+
+    def action_cancel(self) -> None:
+        self._cancelled = True
+        log_widget = self.query_one("#export-log", Log)
+        log_widget.write_line("[Cancelled by user]")
+
+    @work(exclusive=True)
+    async def _run_export(self) -> None:
+        app = self.app
+        assert isinstance(app, JiraExportApp)
+        client = app.confluence_client
+        db = Database(DB_PATH)
+
+        log_widget = self.query_one("#export-log", Log)
+        progress = self.query_one("#overall-progress", ProgressBar)
+        progress_label = self.query_one("#progress-label", Label)
+        task_label = self.query_one("#current-task", Label)
+
+        total_spaces = len(self._spaces)
+        total_pages_exported = 0
+        total_comments_exported = 0
+
+        try:
+            for space_idx, space in enumerate(self._spaces):
+                if self._cancelled:
+                    break
+
+                space_id = str(space["id"])
+                space_key = space.get("key", space_id)
+                space_name = space.get("name", space_key)
+
+                # Save space to DB
+                db.upsert_confluence_space(space)
+
+                task_label.update(
+                    f"Exporting {space_key}: {space_name} ({space_idx + 1}/{total_spaces})"
+                )
+                log_widget.write_line(f"\n--- {space_key}: {space_name} ---")
+
+                # Fetch pages
+                log_widget.write_line("  Fetching pages...")
+                try:
+                    pages = await client.get_pages(space_id)
+                except Exception as exc:
+                    log_widget.write_line(f"  ERROR fetching pages: {exc}")
+                    continue
+
+                log_widget.write_line(f"  Found {len(pages)} pages")
+
+                # Process each page: fetch labels and comments, then store
+                for i, page in enumerate(pages):
+                    if self._cancelled:
+                        break
+
+                    page_id = str(page["id"])
+                    page_title = page.get("title", "?")
+
+                    try:
+                        # Fetch labels
+                        labels = await client.get_labels(page_id)
+
+                        # Store page with labels
+                        db.upsert_confluence_page(page, labels)
+                        total_pages_exported += 1
+
+                        # Fetch footer comments
+                        try:
+                            comments = await client.get_footer_comments(page_id)
+                            for comment in comments:
+                                db.upsert_confluence_comment(page_id, comment)
+                                total_comments_exported += 1
+                        except Exception:
+                            pass  # Some pages may not allow comments
+
+                    except Exception as exc:
+                        log_widget.write_line(
+                            f"  WARNING: Failed to process page '{page_title}': {exc}"
+                        )
+
+                    # Update progress within this space
+                    if len(pages) > 0:
+                        page_pct = (i + 1) / len(pages)
+                        overall_pct = (space_idx + page_pct) / total_spaces * 100
+                        progress.update(progress=overall_pct)
+                        progress_label.update(
+                            f"  {space_key}: {i + 1}/{len(pages)} pages"
+                        )
+
+                log_widget.write_line(
+                    f"  Done: {len(pages)} pages, comments stored"
+                )
+
+                # Update overall progress
+                overall_pct = (space_idx + 1) / total_spaces * 100
+                progress.update(progress=overall_pct)
+
+        except Exception as exc:
+            log_widget.write_line(f"\nERROR: {exc}")
+        finally:
+            db.close()
+
+        if self._cancelled:
+            log_widget.write_line("\nExport cancelled.")
+            task_label.update("[yellow]Export cancelled[/yellow]")
+        else:
+            progress.update(progress=100)
+            log_widget.write_line(
+                f"\nExport complete! {total_pages_exported} pages, "
+                f"{total_comments_exported} comments across {total_spaces} spaces."
+            )
+            task_label.update("[green]Export complete![/green]")
+
+        # Transition to results screen
         self.app.switch_screen(ResultsScreen())
 
 
@@ -365,7 +648,7 @@ class ResultsScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "quit", "Quit"),
-        Binding("b", "go_back", "Back to Projects"),
+        Binding("b", "go_back", "Back to Services"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -374,17 +657,23 @@ class ResultsScreen(Screen):
             yield Label("Export Results", id="results-title")
             yield Static(id="stats-display")
             yield Label("")
-            yield Label("Export formats:", id="export-label")
+            yield Label("JIRA export formats:", id="jira-export-label")
             with Center():
                 with Horizontal(id="export-buttons"):
                     yield Button("CSV", variant="primary", id="csv-btn")
                     yield Button("JIRA CSV", variant="warning", id="jira-csv-btn")
                     yield Button("JSON", variant="success", id="json-btn")
+            yield Label("")
+            yield Label("Confluence export formats:", id="confluence-export-label")
+            with Center():
+                with Horizontal(id="confluence-export-buttons"):
+                    yield Button("Confluence CSV", variant="primary", id="conf-csv-btn")
+                    yield Button("Confluence JSON", variant="success", id="conf-json-btn")
             yield Label("", id="export-status")
             yield Label("")
             with Center():
                 with Horizontal(id="nav-buttons"):
-                    yield Button("Export More Projects", id="more-btn")
+                    yield Button("Export More", id="more-btn")
                     yield Button("Quit", variant="error", id="quit-btn")
         yield Footer()
 
@@ -394,18 +683,48 @@ class ResultsScreen(Screen):
     def _show_stats(self) -> None:
         try:
             db = Database(DB_PATH)
-            stats = db.get_stats()
+            jira_stats = db.get_stats()
+            confluence_stats = db.get_confluence_stats()
             db.close()
+
             display = self.query_one("#stats-display", Static)
-            display.update(
-                f"[bold]Database:[/bold] {DB_PATH}\n\n"
-                f"  Projects: [cyan]{stats['projects']}[/cyan]\n"
-                f"  Issues:   [cyan]{stats['issues']}[/cyan]\n"
-                f"  Comments: [cyan]{stats['comments']}[/cyan]\n"
-                f"  Links:    [cyan]{stats['links']}[/cyan]"
-            )
+            parts = [f"[bold]Database:[/bold] {DB_PATH}\n"]
+
+            has_jira = jira_stats["projects"] > 0 or jira_stats["issues"] > 0
+            has_confluence = confluence_stats["spaces"] > 0 or confluence_stats["pages"] > 0
+
+            if has_jira:
+                parts.append(
+                    f"\n[bold]JIRA[/bold]\n"
+                    f"  Projects: [cyan]{jira_stats['projects']}[/cyan]\n"
+                    f"  Issues:   [cyan]{jira_stats['issues']}[/cyan]\n"
+                    f"  Comments: [cyan]{jira_stats['comments']}[/cyan]\n"
+                    f"  Links:    [cyan]{jira_stats['links']}[/cyan]"
+                )
+
+            if has_confluence:
+                parts.append(
+                    f"\n[bold]Confluence[/bold]\n"
+                    f"  Spaces:   [cyan]{confluence_stats['spaces']}[/cyan]\n"
+                    f"  Pages:    [cyan]{confluence_stats['pages']}[/cyan]\n"
+                    f"  Comments: [cyan]{confluence_stats['comments']}[/cyan]"
+                )
+
+            if not has_jira and not has_confluence:
+                parts.append("\n  No data exported yet.")
+
+            display.update("".join(parts))
+
+            # Show/hide export sections based on available data
+            self.query_one("#jira-export-label", Label).display = has_jira
+            self.query_one("#export-buttons", Horizontal).display = has_jira
+            self.query_one("#confluence-export-label", Label).display = has_confluence
+            self.query_one("#confluence-export-buttons", Horizontal).display = has_confluence
+
         except Exception as exc:
-            self.query_one("#stats-display", Static).update(f"[red]Error reading database: {exc}[/red]")
+            self.query_one("#stats-display", Static).update(
+                f"[red]Error reading database: {exc}[/red]"
+            )
 
     @on(Button.Pressed, "#csv-btn")
     def handle_csv(self) -> None:
@@ -418,6 +737,14 @@ class ResultsScreen(Screen):
     @on(Button.Pressed, "#json-btn")
     def handle_json(self) -> None:
         self._do_export("json")
+
+    @on(Button.Pressed, "#conf-csv-btn")
+    def handle_conf_csv(self) -> None:
+        self._do_export("confluence_csv")
+
+    @on(Button.Pressed, "#conf-json-btn")
+    def handle_conf_json(self) -> None:
+        self._do_export("confluence_json")
 
     def _do_export(self, fmt: str) -> None:
         status = self.query_one("#export-status", Label)
@@ -445,6 +772,21 @@ class ResultsScreen(Screen):
                     status.update(f"[green]JSON exported: {path}[/green]")
                 else:
                     status.update("[yellow]No issues to export.[/yellow]")
+            elif fmt == "confluence_csv":
+                files = export_confluence_csv(db, EXPORT_DIR)
+                db.close()
+                if files:
+                    paths = ", ".join(str(f) for f in files)
+                    status.update(f"[green]Confluence CSV exported: {paths}[/green]")
+                else:
+                    status.update("[yellow]No Confluence pages to export.[/yellow]")
+            elif fmt == "confluence_json":
+                path = export_confluence_json(db, EXPORT_DIR)
+                db.close()
+                if path:
+                    status.update(f"[green]Confluence JSON exported: {path}[/green]")
+                else:
+                    status.update("[yellow]No Confluence pages to export.[/yellow]")
         except Exception as exc:
             status.update(f"[red]Export failed: {exc}[/red]")
 
@@ -457,17 +799,17 @@ class ResultsScreen(Screen):
         self.app.exit()
 
     def action_go_back(self) -> None:
-        self.app.switch_screen(ProjectScreen())
+        self.app.switch_screen(ServiceScreen())
 
     def action_quit(self) -> None:
         self.app.exit()
 
 
 class JiraExportApp(App):
-    """Main Textual application for JIRA data export."""
+    """Main Textual application for JIRA and Confluence data export."""
 
     TITLE = "f-jira"
-    SUB_TITLE = "JIRA Data Export Tool"
+    SUB_TITLE = "Atlassian Data Export Tool"
 
     CSS = """
     #login-form {
@@ -507,12 +849,38 @@ class JiraExportApp(App):
         margin-top: 1;
     }
 
+    #service-form {
+        width: 60;
+        height: auto;
+        padding: 2 4;
+        margin: 2 0;
+        border: solid $accent;
+        background: $surface;
+    }
+
+    #service-title {
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #service-form Button {
+        width: 100%;
+    }
+
+    #jira-desc, #confluence-desc {
+        text-align: center;
+        color: $text-muted;
+        width: 100%;
+    }
+
     #proj-title {
         text-style: bold;
         padding: 1 2;
     }
 
-    #project-table {
+    #project-table, #space-table {
         height: 1fr;
         margin: 0 2;
     }
@@ -565,12 +933,12 @@ class JiraExportApp(App):
         background: $surface;
     }
 
-    #export-buttons {
+    #export-buttons, #confluence-export-buttons {
         height: 3;
         margin: 1 0;
     }
 
-    #export-buttons Button {
+    #export-buttons Button, #confluence-export-buttons Button {
         margin: 0 1;
     }
 
@@ -587,6 +955,11 @@ class JiraExportApp(App):
         text-align: center;
         margin: 1 0;
     }
+
+    #jira-export-label, #confluence-export-label {
+        text-align: center;
+        width: 100%;
+    }
     """
 
     BINDINGS = [
@@ -596,6 +969,7 @@ class JiraExportApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.jira_client: JiraClient | None = None
+        self.confluence_client: ConfluenceClient | None = None
         self.user_info: dict[str, Any] = {}
 
     def on_mount(self) -> None:
@@ -604,4 +978,6 @@ class JiraExportApp(App):
     async def action_quit(self) -> None:
         if self.jira_client:
             await self.jira_client.close()
+        if self.confluence_client:
+            await self.confluence_client.close()
         self.exit()

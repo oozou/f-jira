@@ -1,9 +1,11 @@
-"""SQLite database layer and ADF text extraction."""
+"""SQLite database layer, ADF text extraction, and HTML text extraction."""
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +85,43 @@ CREATE TABLE IF NOT EXISTS field_definitions (
     name TEXT NOT NULL,
     custom BOOLEAN,
     schema_type TEXT
+);
+
+CREATE TABLE IF NOT EXISTS confluence_spaces (
+    id TEXT PRIMARY KEY,
+    key TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT,
+    status TEXT,
+    exported_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS confluence_pages (
+    id TEXT PRIMARY KEY,
+    space_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT,
+    parent_id TEXT,
+    author_id TEXT,
+    body_plain TEXT,
+    body_raw TEXT,
+    labels TEXT,
+    created TEXT,
+    updated TEXT,
+    version_number INTEGER,
+    raw_json TEXT,
+    FOREIGN KEY (space_id) REFERENCES confluence_spaces(id)
+);
+
+CREATE TABLE IF NOT EXISTS confluence_comments (
+    id TEXT PRIMARY KEY,
+    page_id TEXT NOT NULL,
+    author_id TEXT,
+    body_plain TEXT,
+    body_raw TEXT,
+    created TEXT,
+    updated TEXT,
+    FOREIGN KEY (page_id) REFERENCES confluence_pages(id)
 );
 """
 
@@ -170,6 +209,47 @@ def _collect_inline_text(node: dict[str, Any]) -> str:
         else:
             texts.append(_collect_inline_text(child))
     return "".join(texts)
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Simple HTML parser that extracts plain text from HTML/XHTML."""
+
+    # Block-level elements that should produce whitespace boundaries
+    _BLOCK_TAGS = frozenset({
+        "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+        "li", "ol", "ul", "table", "tr", "td", "th", "blockquote",
+        "pre", "hr", "section", "article", "header", "footer",
+    })
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self._BLOCK_TAGS:
+            self._parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._BLOCK_TAGS:
+            self._parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        return re.sub(r"\s+", " ", "".join(self._parts)).strip()
+
+
+def extract_text_from_storage(html_str: str | None) -> str:
+    """Extract plain text from Confluence storage format (XHTML).
+
+    Strips all HTML tags and normalizes whitespace.
+    """
+    if not html_str:
+        return ""
+    parser = _HTMLTextExtractor()
+    parser.feed(html_str)
+    return parser.get_text()
 
 
 def _safe_json(value: Any) -> str | None:
@@ -456,4 +536,134 @@ class Database:
             "issues": self.conn.execute("SELECT count(*) FROM issues").fetchone()[0],
             "comments": self.conn.execute("SELECT count(*) FROM comments").fetchone()[0],
             "links": self.conn.execute("SELECT count(*) FROM issue_links").fetchone()[0],
+        }
+
+    # -- Confluence: Spaces --
+
+    def upsert_confluence_space(self, space: dict[str, Any]) -> None:
+        """Insert or update a Confluence space from API response."""
+        self.conn.execute(
+            """INSERT INTO confluence_spaces (id, key, name, type, status, exported_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                key=excluded.key, name=excluded.name, type=excluded.type,
+                status=excluded.status, exported_at=excluded.exported_at""",
+            (
+                space["id"],
+                space["key"],
+                space["name"],
+                space.get("type"),
+                space.get("status"),
+            ),
+        )
+        self.conn.commit()
+
+    # -- Confluence: Pages --
+
+    def upsert_confluence_page(
+        self, page: dict[str, Any], labels: list[dict[str, Any]] | None = None
+    ) -> None:
+        """Insert or update a Confluence page from API response."""
+        body_storage = page.get("body", {}).get("storage", {}).get("value", "")
+        body_plain = extract_text_from_storage(body_storage)
+        label_names = json.dumps([lb.get("name", lb.get("prefix", "")) for lb in (labels or [])])
+
+        version = page.get("version", {})
+        version_number = version.get("number") if isinstance(version, dict) else None
+
+        self.conn.execute(
+            """INSERT INTO confluence_pages
+            (id, space_id, title, status, parent_id, author_id,
+             body_plain, body_raw, labels, created, updated, version_number, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                space_id=excluded.space_id, title=excluded.title, status=excluded.status,
+                parent_id=excluded.parent_id, author_id=excluded.author_id,
+                body_plain=excluded.body_plain, body_raw=excluded.body_raw,
+                labels=excluded.labels, created=excluded.created, updated=excluded.updated,
+                version_number=excluded.version_number, raw_json=excluded.raw_json""",
+            (
+                page["id"],
+                page.get("spaceId", ""),
+                page.get("title", ""),
+                page.get("status"),
+                page.get("parentId"),
+                page.get("authorId"),
+                body_plain,
+                body_storage,
+                label_names,
+                page.get("createdAt"),
+                page.get("version", {}).get("createdAt") if isinstance(page.get("version"), dict) else None,
+                version_number,
+                _safe_json(page),
+            ),
+        )
+        self.conn.commit()
+
+    # -- Confluence: Comments --
+
+    def upsert_confluence_comment(self, page_id: str, comment: dict[str, Any]) -> None:
+        """Insert or update a Confluence comment from API response."""
+        body_storage = comment.get("body", {}).get("storage", {}).get("value", "")
+        body_plain = extract_text_from_storage(body_storage)
+
+        self.conn.execute(
+            """INSERT INTO confluence_comments
+            (id, page_id, author_id, body_plain, body_raw, created, updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                page_id=excluded.page_id, author_id=excluded.author_id,
+                body_plain=excluded.body_plain, body_raw=excluded.body_raw,
+                created=excluded.created, updated=excluded.updated""",
+            (
+                comment["id"],
+                page_id,
+                comment.get("authorId"),
+                body_plain,
+                body_storage,
+                comment.get("createdAt"),
+                comment.get("version", {}).get("createdAt") if isinstance(comment.get("version"), dict) else None,
+            ),
+        )
+        self.conn.commit()
+
+    # -- Confluence: Query helpers --
+
+    def get_confluence_spaces(self) -> list[dict[str, Any]]:
+        """Return all exported Confluence spaces."""
+        rows = self.conn.execute("SELECT * FROM confluence_spaces ORDER BY key").fetchall()
+        return [dict(row) for row in rows]
+
+    def get_confluence_pages(self, space_id: str | None = None) -> list[dict[str, Any]]:
+        """Return Confluence pages, optionally filtered by space."""
+        if space_id:
+            rows = self.conn.execute(
+                "SELECT * FROM confluence_pages WHERE space_id = ? ORDER BY title",
+                (space_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM confluence_pages ORDER BY space_id, title"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_confluence_comments(self, page_id: str | None = None) -> list[dict[str, Any]]:
+        """Return Confluence comments, optionally filtered by page."""
+        if page_id:
+            rows = self.conn.execute(
+                "SELECT * FROM confluence_comments WHERE page_id = ? ORDER BY created",
+                (page_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM confluence_comments ORDER BY page_id, created"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_confluence_stats(self) -> dict[str, int]:
+        """Return Confluence summary statistics."""
+        return {
+            "spaces": self.conn.execute("SELECT count(*) FROM confluence_spaces").fetchone()[0],
+            "pages": self.conn.execute("SELECT count(*) FROM confluence_pages").fetchone()[0],
+            "comments": self.conn.execute("SELECT count(*) FROM confluence_comments").fetchone()[0],
         }

@@ -1,4 +1,4 @@
-"""Export JIRA data from SQLite to CSV, JIRA CSV, and JSON formats."""
+"""Export JIRA and Confluence data from SQLite to CSV and JSON formats."""
 
 from __future__ import annotations
 
@@ -231,5 +231,94 @@ def export_json(db: Database, output_dir: Path, project_key: str | None = None) 
     json_path = output_dir / f"issues{suffix}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(full_issues, f, indent=2, default=str)
+
+    return json_path
+
+
+# -- Confluence exports --
+
+CONFLUENCE_PAGE_FIELDS = [
+    "id", "space_id", "title", "status", "parent_id",
+    "body_plain", "labels", "created", "updated",
+]
+
+CONFLUENCE_COMMENT_FIELDS = [
+    "id", "page_id", "author_id", "body_plain", "created", "updated",
+]
+
+
+def export_confluence_csv(
+    db: Database, output_dir: Path, space_id: str | None = None
+) -> list[Path]:
+    """Export Confluence pages and comments to CSV files.
+
+    Returns list of created file paths.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    created_files: list[Path] = []
+
+    pages = db.get_confluence_pages(space_id)
+    if not pages:
+        return created_files
+
+    suffix = f"_{space_id}" if space_id else ""
+
+    # -- Pages CSV --
+    pages_path = output_dir / f"pages{suffix}.csv"
+    with open(pages_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CONFLUENCE_PAGE_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for page in pages:
+            row = {field: page.get(field, "") or "" for field in CONFLUENCE_PAGE_FIELDS}
+            # Flatten labels JSON for readability
+            row["labels"] = ", ".join(_parse_json_field(page.get("labels")))
+            writer.writerow(row)
+    created_files.append(pages_path)
+
+    # -- Page comments CSV --
+    comments = db.get_confluence_comments()
+    if space_id:
+        page_ids = {p["id"] for p in pages}
+        comments = [c for c in comments if c["page_id"] in page_ids]
+
+    if comments:
+        comments_path = output_dir / f"page_comments{suffix}.csv"
+        with open(comments_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=CONFLUENCE_COMMENT_FIELDS, extrasaction="ignore"
+            )
+            writer.writeheader()
+            for comment in comments:
+                writer.writerow(
+                    {field: comment.get(field, "") or "" for field in CONFLUENCE_COMMENT_FIELDS}
+                )
+        created_files.append(comments_path)
+
+    return created_files
+
+
+def export_confluence_json(
+    db: Database, output_dir: Path, space_id: str | None = None
+) -> Path | None:
+    """Export full Confluence page data as JSON."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pages = db.get_confluence_pages(space_id)
+    if not pages:
+        return None
+
+    full_pages: list[dict[str, Any]] = []
+    for page in pages:
+        if page.get("raw_json"):
+            try:
+                full_pages.append(json.loads(page["raw_json"]))
+            except (json.JSONDecodeError, TypeError):
+                full_pages.append(dict(page))
+        else:
+            full_pages.append(dict(page))
+
+    suffix = f"_{space_id}" if space_id else ""
+    json_path = output_dir / f"pages{suffix}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(full_pages, f, indent=2, default=str)
 
     return json_path
