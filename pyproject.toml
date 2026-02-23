@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "f-jira"
+version = "0.1.0"
+description = "A TUI for exporting Jira data"
+requires-python = ">=3.12"
+dependencies = [
+    "textual",
+    "httpx",
+]
+
+[project.scripts]
+f-jira = "f_jira.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/f_jira"]
