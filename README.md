@@ -3,6 +3,11 @@
 A terminal UI for exporting JIRA and Confluence data into a local SQLite database, with re-export
 to CSV, JSON, or JIRA-importable CSV.
 
+<img height="300" alt="a" src="https://github.com/user-attachments/assets/0c2da049-2288-44d1-9708-213d3206b1e0" />
+<img height="300" alt="b" src="https://github.com/user-attachments/assets/e8b1c6d2-d5b8-4f4c-8ac0-e2bbfd0d6a0f" />
+<img height="300" alt="c" src="https://github.com/user-attachments/assets/a8970dff-5751-469f-a4c2-d30e4958fbbc" />
+<img height="300" alt="d" src="https://github.com/user-attachments/assets/392ad8fd-d6ee-49f4-afef-736bb7268e0e" />
+
 ## Quick start
 
 ```bash
